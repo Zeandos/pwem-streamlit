@@ -1,0 +1,7 @@
+# PWEM Streamlit dashboard — Python 3.10+
+streamlit>=1.45
+numpy>=1.26
+scipy>=1.11
+pandas>=2.2
+matplotlib>=3.8
+openpyxl>=3.1
