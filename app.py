@@ -313,7 +313,7 @@ st.markdown(
     "**Γ → X → M → Γ**, the generalized eigenvalue problems "
     "$A\\,\\mathbf{v} = \\lambda\\,B\\,\\mathbf{v}$ are solved for the "
     "**E-mode (TE)** and **H-mode (TM)** polarizations, and the normalized "
-    "frequencies $\\omega a / 2\\pi c = \\sqrt{\\lambda}$ are plotted as band diagrams."
+    "frequencies $\\omega a / 2\\pi c are plotted as band diagrams."
 )
 
 # =============================================================================
@@ -387,21 +387,21 @@ with st.sidebar:
     a = st.session_state["a"]
     r_over_a = st.number_input(
         "Cylinder radius r / a",
-        min_value=0.05, max_value=0.45, step=0.001,
+        min_value=0.05, max_value=0.50, step=0.01, format="%.3f",
         key="r_over_a",
         help="Rod radius divided by the lattice constant — auto-loaded from "
              "the selected crystal, free to adjust.",
     )
     eps_cyl = st.number_input(
         "Cylinder permittivity ε_c",
-        min_value=0.1, max_value=1000.0, step=0.01,
+        min_value=0.1, max_value=20.0, step=0.1,
         key="eps_cyl",
         help="Rod permittivity — type the exact value you need "
              "(auto-loaded from the selected crystal, free to adjust).",
     )
     eps_bg = st.number_input(
         "Background permittivity ε_bg",
-        min_value=0.1, max_value=1000.0, step=0.01,
+        min_value=0.1, max_value=20.0, step=0.1,
         key="eps_bg",
         help="Matrix permittivity — type the exact value you need "
              "(auto-loaded from the selected crystal, free to adjust).",
