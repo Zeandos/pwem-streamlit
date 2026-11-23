@@ -8,14 +8,6 @@ Refactored from the original ``PWEM.py`` (and its helper module
 ``convmat.py``). All core numerical work — unit-cell construction, FFT-based
 convolution matrices, Bloch-path sampling and the two generalized eigenvalue
 problems (E-mode / H-mode) — is preserved exactly as in the original script.
-Only the presentation layer changed:
-
-* hardcoded parameters  -> interactive widgets in ``st.sidebar``
-* ``print()`` / ``plt.show()`` -> ``st.markdown`` / ``st.metric`` / ``st.pyplot``
-* heavy computation     -> ``@st.cache_data`` (recomputed only when inputs change)
-* results table + in-memory ``.xlsx`` export (``openpyxl``)
-* crystal presets loaded from a local SQLite database (``database.py``)
-  — hybrid mode: SQL-driven initial values + free manual sliders
 
 The original script does not read any CSV/Excel file, so no
 ``st.file_uploader`` is required — the model is fully parameter-driven and
@@ -29,9 +21,10 @@ from __future__ import annotations
 
 import io
 
+import matplotlib
 import numpy as np
 import pandas as pd
-import matplotlib
+
 matplotlib.use("Agg")  # headless-safe backend: Streamlit never calls plt.show()
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -40,158 +33,44 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from scipy import linalg
 
-# ``convmat.py`` ships in the same folder as this script (same import as the
-# original PWEM.py).
-from convmat import convmat
-
-# Local SQLite backend with the crystal preset data (see database.py).
-from database import (
+# Core package (see src/): the pure numpy/scipy physics engine and the
+# SQLite data access layer; central settings live in the root ``config``.
+import config
+from src.database import (
     get_crystal_by_name,
     get_crystals,
     init_database,
 )
-
+from src.physics import (
+    build_unit_cell as _build_unit_cell,
+    compute_band_diagram as _compute_band_diagram,
+)
 
 # =============================================================================
 # HEAVY COMPUTATION (cached)
 # =============================================================================
 
-@st.cache_data(show_spinner="Building unit cell and convolution matrices…")
-def build_unit_cell(a: float, r_over_a: float, eps_cyl: float, eps_bg: float,
-                    nx: int, p_order: int, q_order: int) -> dict:
-    """Build the discretized unit cell and the PWEM convolution matrices.
 
-    Mirrors the original "BUILD UNIT CELL" and "COMPUTE CONVOLUTION MATRIX"
-    blocks of PWEM.py one-for-one (the only change: the background
-    permittivity, hardcoded to 10 in the original, is now a parameter).
-    """
-    r = r_over_a * a          # original: r = 0.15 * a
-
-    # --- meshgrid on the cell (original code) -----------------------------
-    Nx, Ny = nx, nx           # original: Ny = Nx
-    dx = a / Nx
-    dy = a / Ny
-    xa = np.linspace(1, Nx, Nx) * dx
-    xa = xa - np.mean(xa)
-    ya = np.linspace(1, Ny, Ny) * dy
-    ya = ya - np.mean(ya)
-    [Y, X] = np.meshgrid(ya, xa)
-
-    # --- build unit cell: dielectric cylinder in a background --------------
-    # NOTE: the mask must be True INSIDE the cylinder (`< r*r`). The original
-    # PWEM.py used `> r*r`, which filled the cylinder with eps_bg and the
-    # background with eps_cyl — i.e. the two permittivities were swapped.
-    UR = np.ones((Nx, Ny))
-    ER = (np.square(X) + np.square(Y)) < r * r
-    ER = eps_bg + (eps_cyl - eps_bg) * ER   # inside: eps_cyl, outside: eps_bg
-
-    # --- convolution matrices (FFT based, see convmat.py) ------------------
-    ERC = np.array(convmat(ER, p_order, q_order, Nx, Ny), dtype=complex)
-    URC = np.array(convmat(UR, p_order, q_order, Nx, Ny), dtype=complex)
-
-    return {
-        "ER": ER,
-        "ERC": ERC,
-        "URC": URC,
-        "xa": xa,
-        "ya": ya,
-        "r": r,
-    }
+# =============================================================================
+# HEAVY COMPUTATION (cached)
+# =============================================================================
+#
+# The numerical work itself lives in ``src/physics.py`` (pure numpy/scipy,
+# unit-testable). Here we only wrap it with Streamlit's caching so that a
+# sidebar change recomputes only what actually depends on it.
 
 
-@st.cache_data(show_spinner="Solving the eigenvalue problem along Γ → X → M → Γ…")
-def compute_band_diagram(erc: np.ndarray, urc: np.ndarray,
-                         p_order: int, nb: int, a: float) -> dict:
-    """Sample the Bloch path and solve the E/H-mode generalized eigenproblems.
-
-    Mirrors the original "COMPUTE LIST OF BLOCH VECTORS" and "MAIN CYCLE OF
-    PROGRAM" blocks. The two matrix inverses are hoisted out of the loop —
-    numerically identical to the original per-iteration ``np.linalg.inv``,
-    just faster.
-    """
-    q_order = p_order  # original: Q = P
-
-    # --- reciprocal lattice vectors (original code) ------------------------
-    t1 = np.array([[1], [0]])
-    t2 = np.array([[0], [1]])
-    T1 = np.dot(t1, 2 * np.pi / a)
-    T2 = np.dot(t2, 2 * np.pi / a)
-
-    # --- main high-symmetry points of the Brillouin zone --------------------
-    G = np.array([[0], [0]])
-    X = np.dot(0.5, T1)
-    M = np.dot(0.5, T1) + np.dot(0.5, T2)
-
-    # --- Bloch-vector list along G->X->M->G (original code) -----------------
-    GXx = np.linspace(G[0], X[0], nb)
-    XMx = np.linspace(X[0], M[0], nb)
-    MGx = np.linspace(M[0], G[0], int(np.floor(nb * np.sqrt(2))))
-
-    GXy = np.linspace(G[1], X[1], nb)
-    XMy = np.linspace(X[1], M[1], nb)
-    MGy = np.linspace(M[1], G[1], int(np.floor(nb * np.sqrt(2))))
-
-    # (`.ravel()` is a no-op numerically: linspace over the (2,1) high-symmetry
-    # point entries returns (N,1) columns; the original script's broadcasting
-    # absorbed that, but downstream pandas needs plain 1-D arrays.)
-    bx = np.concatenate((GXx, XMx, MGx)).ravel()
-    by = np.concatenate((GXy, XMy, MGy)).ravel()
-
-    # --- wave vectors (original code) ---------------------------------------
-    p = np.linspace(-np.floor(p_order / 2), np.floor(p_order / 2), p_order)
-    q = np.linspace(-np.floor(q_order / 2), np.floor(q_order / 2), q_order)
-
-    # Inverses needed by both eigenproblems (hoisted out of the loop)
-    urc_inv = np.linalg.inv(urc)
-    erc_inv = np.linalg.inv(erc)
-
-    WnEl = []
-    WnHl = []
-
-    for ii in range(0, np.size(bx)):
-        # CALCULATE WAVE VECTORS
-        kx = bx[ii] - 2 * np.pi * p / a
-        ky = by[ii] - 2 * np.pi * q / a
-
-        # CREATING MESH OF WAVE VECTORS
-        [ky, kx] = np.meshgrid(ky, kx)
-
-        # CALCULATE WAVE MATRIX OF WAVE VECTORS
-        KX = np.diagflat(kx)
-        KY = np.diagflat(ky)
-
-        # BUILD EIG-VALUE PROBLEM E-MODE  (A v = λ B v,  A = K·ε⁻¹·K)
-        AE = np.dot(np.dot(KX, urc_inv), KX) + np.dot(np.dot(KY, urc_inv), KY)
-        BE = erc
-
-        # BUILD EIG-VALUE PROBLEM H-MODE  (A v = λ B v,  A = K·(1/ε)⁻¹·K form)
-        AH = np.dot(np.dot(KX, erc_inv), KX) + np.dot(np.dot(KY, erc_inv), KY)
-        BH = urc
-
-        # CALCULATE EIG-VALUE
-        [DEval, DEvec] = linalg.eig(AE, BE)
-        [DHval, DHvec] = linalg.eig(AH, BH)
-
-        # SORTING AND NORMALIZATION FREQUENCIES
-        WnEl.append(np.sort((a * np.sqrt(DEval) / (2 * np.pi))))
-        WnHl.append(np.sort((a * np.sqrt(DHval) / (2 * np.pi))))
-
-    # CREATE AN ARRAY OF FREQUENCIES
-    WnE = np.array(WnEl)
-    WnH = np.array(WnHl)
-
-    return {
-        "WnE": WnE,
-        "WnH": WnH,
-        "bx": bx,
-        "by": by,
-        "n_points": int(np.size(bx)),
-    }
-
+build_unit_cell = st.cache_data(show_spinner="Building unit cell and convolution matrices…")(
+    _build_unit_cell
+)
+compute_band_diagram = st.cache_data(show_spinner="Solving the eigenvalue problem along Γ → X → M → Γ…")(
+    _compute_band_diagram
+)
 
 # =============================================================================
 # FIGURE BUILDERS (thin matplotlib wrappers, same styling as PWEM.py)
 # =============================================================================
+
 
 def make_unit_cell_figure(ER: np.ndarray) -> plt.Figure:
     """Reproduces the original 'SHOW UNIT CELL' plot."""
@@ -229,6 +108,7 @@ def make_band_figure(WnE: np.ndarray, WnH: np.ndarray, nb: int) -> plt.Figure:
 # EXCEL EXPORT (openpyxl, fully in-memory — no temporary files on disk)
 # =============================================================================
 
+
 @st.cache_data(show_spinner=False)
 def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
     """Serialize the results DataFrame to a formatted .xlsx in memory."""
@@ -263,6 +143,7 @@ def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
 # UI HELPERS
 # =============================================================================
 
+
 def first_band_edge(wn: np.ndarray) -> float:
     """Smallest positive real frequency over the whole sampled path."""
     pos = np.real(wn)
@@ -270,16 +151,19 @@ def first_band_edge(wn: np.ndarray) -> float:
     return float(pos.min()) if pos.size else float("nan")
 
 
-def build_results_dataframe(wn_e: np.ndarray, wn_h: np.ndarray,
-                            bx: np.ndarray, by: np.ndarray,
-                            nb: int, n_bands: int) -> pd.DataFrame:
+def build_results_dataframe(
+    wn_e: np.ndarray,
+    wn_h: np.ndarray,
+    bx: np.ndarray,
+    by: np.ndarray,
+    nb: int,
+    n_bands: int,
+) -> pd.DataFrame:
     """Assemble the path table shown in the UI and exported to Excel."""
     n_points = int(np.size(bx))
     n_bands = min(n_bands, wn_e.shape[1])
 
-    segments = (
-        ["Γ→X"] * nb + ["X→M"] * nb + ["M→Γ"] * (n_points - 2 * nb)
-    )
+    segments = ["Γ→X"] * nb + ["X→M"] * nb + ["M→Γ"] * (n_points - 2 * nb)
 
     data = {
         "Index": np.arange(n_points),
@@ -332,7 +216,7 @@ with st.sidebar:
         "Only high-contrast crystals (rod ε > 10)",
         value=False,
         help="Filters the dropdown list directly in SQL: the query gets an "
-             "extra WHERE clause (JOIN + WHERE, secure parameterization).",
+        "extra WHERE clause (JOIN + WHERE, secure parameterization).",
     )
     # (The query text/parameters are not displayed in the UI.)
     crystal_rows, _, _ = get_crystals(high_contrast=only_high_contrast)
@@ -351,9 +235,7 @@ with st.sidebar:
         crystal = get_crystal_by_name(selected_row["crystal_name"])
     else:
         crystal = None
-        st.warning(
-            "No crystals match the filter — uncheck it to see the full list."
-        )
+        st.warning("No crystals match the filter — uncheck it to see the full list.")
 
     # Pre-fill the parameter widgets from the SQL row ("pre-configured
     # widget" pattern): the values are written into the session state ONLY
@@ -374,11 +256,11 @@ with st.sidebar:
     # Fallback defaults for the very first run / empty filter result, so the
     # keyed widgets below always have a session-state value (the widgets must
     # NOT receive a separate `value=` argument when a `key` is used).
-    st.session_state.setdefault("a", 2.0)
-    st.session_state.setdefault("r_over_a", 0.15)
-    st.session_state.setdefault("eps_cyl", 2.0)
-    st.session_state.setdefault("eps_bg", 10.0)
-    st.session_state.setdefault("p_order", 11)
+    st.session_state.setdefault("a", config.DEFAULT_A)
+    st.session_state.setdefault("r_over_a", config.DEFAULT_R_OVER_A)
+    st.session_state.setdefault("eps_cyl", config.DEFAULT_EPS_CYL)
+    st.session_state.setdefault("eps_bg", config.DEFAULT_EPS_BG)
+    st.session_state.setdefault("p_order", config.DEFAULT_P_ORDER)
 
     st.subheader("Unit cell")
     # The lattice constant has no manual input: it is taken from the selected
@@ -387,37 +269,46 @@ with st.sidebar:
     a = st.session_state["a"]
     r_over_a = st.number_input(
         "Cylinder radius r / a",
-        min_value=0.05, max_value=0.50, step=0.01, format="%.3f",
+        min_value=0.05,
+        max_value=0.50,
+        step=0.01,
+        format="%.3f",
         key="r_over_a",
         help="Rod radius divided by the lattice constant — auto-loaded from "
-             "the selected crystal, free to adjust.",
+        "the selected crystal, free to adjust.",
     )
     eps_cyl = st.number_input(
         "Cylinder permittivity ε_c",
-        min_value=0.1, max_value=20.0, step=0.1,
+        min_value=0.1,
+        max_value=20.0,
+        step=0.1,
         key="eps_cyl",
         help="Rod permittivity — type the exact value you need "
-             "(auto-loaded from the selected crystal, free to adjust).",
+        "(auto-loaded from the selected crystal, free to adjust).",
     )
     eps_bg = st.number_input(
         "Background permittivity ε_bg",
-        min_value=0.1, max_value=20.0, step=0.1,
+        min_value=0.1,
+        max_value=20.0,
+        step=0.1,
         key="eps_bg",
         help="Matrix permittivity — type the exact value you need "
-             "(auto-loaded from the selected crystal, free to adjust).",
+        "(auto-loaded from the selected crystal, free to adjust).",
     )
 
     st.subheader("Discretization")
     nx = st.selectbox(
         "Grid resolution N_x = N_y",
-        options=[129, 257, 513, 769, 1025],
+        options=config.GRID_OPTIONS,
         index=2,
         help="Odd grid sizes keep the FFT-based convolution matrix centered "
-             "(original: Nx = 513). Higher = more accurate but slower.",
+        "(original: Nx = 513). Higher = more accurate but slower.",
     )
     p_order = st.slider(
         "Plane-wave order P (Q = P)",
-        min_value=5, max_value=15, step=2,
+        min_value=5,
+        max_value=15,
+        step=2,
         key="p_order",
         help=(
             "Number of plane waves per axis in the basis — auto-loaded from "
@@ -428,15 +319,21 @@ with st.sidebar:
     )
     nb = st.number_input(
         "Bloch points per segment N_B",
-        min_value=5, max_value=100, value=15, step=1,
+        min_value=5,
+        max_value=100,
+        value=config.DEFAULT_NB,
+        step=1,
         help="Sampling density of the Γ→X and X→M segments; the M→Γ segment "
-             "uses floor(N_B·√2) points (original: N_B = 15).",
+        "uses floor(N_B·√2) points (original: N_B = 15).",
     )
 
     st.subheader("Output")
     n_bands_out = st.number_input(
         "Bands shown in table & export",
-        min_value=1, max_value=128, value=8, step=1,
+        min_value=1,
+        max_value=128,
+        value=config.DEFAULT_N_BANDS,
+        step=1,
         help="How many lowest bands of each mode to display and export.",
     )
 
@@ -447,8 +344,12 @@ with st.sidebar:
 For each Bloch vector β, Maxwell's equations reduce to two generalized
 eigenvalue problems:
 
-- **E-mode (TE):** `(KX·ε⁻¹·KX + KY·ε⁻¹·KY) v = λ · ε v`
-- **H-mode (TM):** `(KX·ε⁻¹·KX + KY·ε⁻¹·KY) v = λ · (1/ε) v`
+- **E-mode (TE, E ∥ rod axis):**
+  `(KX·URC⁻¹·KX + KY·URC⁻¹·KY) v = λ·ERC·v` — since the URC matrix is
+  (nearly) the identity in the Fourier basis, this is effectively `K²v = λεv`
+- **H-mode (TM, H ∥ rod axis):**
+  `(KX·ERC⁻¹·KX + KY·ERC⁻¹·KY) v = λ·URC·v` — effectively
+  `(K·ε⁻¹·K)v = λv`
 
 where `KX`, `KY` are diagonal matrices of the shifted wave vectors
 `kx,ky = β − 2π·p/a` and the ε-operators act through the FFT-based
@@ -472,19 +373,19 @@ cell = build_unit_cell(a, r_over_a, eps_cyl, eps_bg, nx, p_order, p_order)
 
 col_fig, col_info = st.columns([2, 3])
 with col_fig:
-    fig_cell = make_unit_cell_figure(cell["ER"])
+    fig_cell = make_unit_cell_figure(cell.ER)
     st.pyplot(fig_cell, use_container_width=True)
     plt.close(fig_cell)  # free the figure memory
     st.caption(
         "Shading: relative permittivity — cylinder "
         f"ε_c = {eps_cyl:g} vs background ε_bg = {eps_bg:g} "
-        f"(r = {cell['r']:.3f})."
+        f"(r = {cell.r:.3f})."
     )
 
 with col_info:
     st.markdown("**Current configuration**")
     st.markdown(
-        f"- Lattice constant: **a = {a:g}**  (cylinder r = {cell['r']:.4f})\n"
+        f"- Lattice constant: **a = {a:g}**  (cylinder r = {cell.r:.4f})\n"
         f"- Permittivities: **ε_c = {eps_cyl:g}**, **ε_bg = {eps_bg:g}**\n"
         f"- Grid: **{nx} × {nx}**  ·  Plane-wave basis: **{p_order} × {p_order}** "
         f"({p_order * p_order} vectors)\n"
@@ -504,15 +405,15 @@ with col_info:
 st.divider()
 st.subheader("2 · Band diagram along Γ → X → M → Γ")
 
-bands = compute_band_diagram(cell["ERC"], cell["URC"], p_order, nb, a)
-WnE, WnH = bands["WnE"], bands["WnH"]
-bx, by = bands["bx"], bands["by"]
+bands = compute_band_diagram(cell.ERC, cell.URC, p_order, nb, a)
+WnE, WnH = bands.WnE, bands.WnH
+bx, by = bands.bx, bands.by
 
 # --- key numerical results (replaces the old print() statements) ------------
 e_edge = first_band_edge(WnE)
 h_edge = first_band_edge(WnH)
 f_max = float(np.max(np.concatenate([np.real(WnE), np.real(WnH)])))
-n_solves = 2 * bands["n_points"]
+n_solves = 2 * bands.n_points
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("E-mode first band edge (ωa/2πc)", f"{e_edge:.4f}")

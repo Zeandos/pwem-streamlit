@@ -1,7 +1,7 @@
 """
 database.py
 ===========
-SQLite relational backend for the PWEM Streamlit dashboard (``app.py``).
+SQLite data access layer (DAL) for the PWEM Streamlit dashboard (``app.py``).
 
 Schema (normalized, two related tables)
 ---------------------------------------
@@ -33,17 +33,14 @@ Conventions
 
 from __future__ import annotations
 
-import os
 import sqlite3
+
+# Central settings (paths) live in the project-root ``config`` module.
+import config  # noqa: E402  (top-level module at the project root)
 
 # =============================================================================
 # Constants
 # =============================================================================
-
-#: The database file lives next to this module (no hardcoded absolute path).
-DB_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "pwem_crystals.db"
-)
 
 #: A crystal is "high contrast" when the rod dielectric constant exceeds this
 #: threshold (the sidebar filter adds ``WHERE rod.eps > ?`` with this value).
@@ -115,7 +112,7 @@ CRYSTAL_BY_NAME_SQL = """
 # Connection / schema
 # =============================================================================
 
-def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: str = config.DB_PATH) -> sqlite3.Connection:
     """Open a connection with dict-like rows (``sqlite3.Row``) and active
     foreign-key enforcement."""
     conn = sqlite3.connect(db_path)
@@ -124,7 +121,7 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def init_database(db_path: str = DB_PATH) -> str:
+def init_database(db_path: str = config.DB_PATH) -> str:
     """Create the schema on the first run (empty database) and seed data.
 
     Idempotent: if tables already contain data they are left untouched.
@@ -207,12 +204,16 @@ def init_database(db_path: str = DB_PATH) -> str:
 # Queries
 # =============================================================================
 
-def get_crystals(high_contrast: bool = False):
+def get_crystals(
+    high_contrast: bool = False, db_path: str | None = None
+):
     """Retrieve the list of crystals (JOINing both materials relations).
 
     With ``high_contrast=True`` an extra ``WHERE rod.eps > ?`` clause is
     appended (secure parameterization — the threshold is a bound parameter,
     never interpolated into the SQL text).
+
+    ``db_path`` overrides the default database location (used by the tests).
 
     Returns
     -------
@@ -228,7 +229,7 @@ def get_crystals(high_contrast: bool = False):
         params.append(HIGH_CONTRAST_EPS_THRESHOLD)
     sql += "    ORDER BY c.name\n"
 
-    conn = get_connection()
+    conn = get_connection(db_path or config.DB_PATH)
     try:
         rows = [dict(row) for row in conn.execute(sql, params)]
     finally:
@@ -236,14 +237,16 @@ def get_crystals(high_contrast: bool = False):
     return rows, sql, params
 
 
-def get_crystal_by_name(name: str):
+def get_crystal_by_name(name: str, db_path: str | None = None):
     """Retrieve ALL parameters of one crystal with a single SQL query.
 
     One JOINed statement (crystals -> materials x2) with secure
     parameterization (``?``). Returns a dict-like mapping, or ``None`` when
     the crystal name is unknown.
+
+    ``db_path`` overrides the default database location (used by the tests).
     """
-    conn = get_connection()
+    conn = get_connection(db_path or config.DB_PATH)
     try:
         row = conn.execute(CRYSTAL_BY_NAME_SQL, (name,)).fetchone()
     finally:
@@ -252,7 +255,7 @@ def get_crystal_by_name(name: str):
 
 
 # =============================================================================
-# Small CLI for a quick manual check:  python database.py
+# Small CLI for a quick manual check:  python -m src.database
 # =============================================================================
 
 if __name__ == "__main__":
